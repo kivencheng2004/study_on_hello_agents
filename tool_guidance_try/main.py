@@ -1,128 +1,116 @@
 import os
-import re
-from tools.get_weather import get_weather
-from tools.search_attraction import get_attraction
-from openai import OpenAI
+from typing import Annotated, TypedDict
+from dotenv import load_dotenv
 
-available_tools = {
-    "get_weather": get_weather,
-    "get_attraction": get_attraction,
-}
+# 1. 加载配置（必须在导入工具前执行，确保工具能读到环境变量）
+load_dotenv()
 
-class OpenAICompatibleClient:
-    def __init__(self, model: str, api_key: str, base_url: str):
-        self.model = model
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 
-    def generate(self, prompt: str, system_prompt:str) ->str:
-        print("正在调用大模型...")
-        try:
-            messages = [
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': prompt},
-        ]
-            response = self.client.chat.completions.create(
-                model = self.model,
-                messages = messages,
-                stream = False
-            )
-            answer = response.choices[0].message.content
-            print("大语言模型响应成功。")
-            return answer
-        except Exception as e:
-            print(f"调用LLM API时发生错误：{e}")
-            return "错误：调用语言模型服务时出错。"
+# 2. 导入你现有的工具函数
+from tools.get_weather import get_weather as raw_get_weather
+from tools.search_attraction import get_attraction as raw_get_attraction
 
-AGENT_SYSTEM_PROMPT = """
-你是一个智能旅行助手。你的任务是分析用户的请求，并使用可用工具一步步地解决问题。
 
-# 可用工具:
-- `get_weather(city: str)`: 查询指定城市的实时天气。
-- `get_attraction(city: str, weather: str)`: 根据城市和天气搜索推荐的旅游景点。
+# 3. 包装工具：LangGraph 通过这些装饰器识别工具用途
+@tool
+def get_weather(city: str):
+    """查询指定城市的实时天气。"""
+    return raw_get_weather(city)
 
-# 输出格式要求:
-你的每次回复必须严格遵循以下格式，包含一对Thought和Action：
 
-Thought: [你的思考过程和下一步计划]
-Action: [你要执行的具体行动]
+@tool
+def get_attraction(city: str, weather: str):
+    """根据城市和天气搜索推荐的旅游景点。此工具内部已集成 Tavily 搜索。"""
+    # 这里的逻辑直接复用你 search_attraction.py 里的代码
+    return raw_get_attraction(city, weather)
 
-Action的格式必须是以下之一：
-1. 调用工具：function_name(arg_name="arg_value")
-2. 结束任务：Finish[最终答案]
 
-# 重要提示:
-- 每次只输出一对Thought-Action
-- Action必须在同一行，不要换行
-- 当收集到足够信息可以回答用户问题时，必须使用 Action: Finish[最终答案] 格式结束
+# 定义工具集合
+tools = [get_weather, get_attraction]
+tool_node = ToolNode(tools)
 
-请开始吧！
-"""
 
+# 4. 定义状态 (State)
+class AgentState(TypedDict):
+    # add_messages 会自动把新对话追加到 messages 列表中
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+# 5. 初始化模型并绑定工具
+llm = ChatOpenAI(
+    model=os.getenv("MODEL_ID", "gpt-4o"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+    temperature=0
+).bind_tools(tools)
+
+
+# 6. 定义节点逻辑
+def call_model(state: AgentState):
+    """Agent 节点：负责思考和决策"""
+    response = llm.invoke(state['messages'])
+    return {"messages": [response]}
+
+
+def should_continue(state: AgentState):
+    """条件路由：判断模型是想调工具还是结束对话"""
+    last_message = state['messages'][-1]
+    if last_message.tool_calls:
+        return "action"
+    return END
+
+
+# 7. 构建图 (Graph)
+workflow = StateGraph(AgentState)
+
+workflow.add_node("agent", call_model)
+workflow.add_node("action", tool_node)
+
+workflow.set_entry_point("agent")
+
+# 设置带条件的边
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "action": "action",
+        END: END
+    }
+)
+
+# 工具执行完后，必须回到 agent 节点让它总结结果
+workflow.add_edge("action", "agent")
+
+app = workflow.compile()
+
+
+# 8. 执行入口
 def main():
-    API_KEY = "API_KEY"
-    BASE_URL = "base_url"
-    MODEL_ID = "model_name"
-    os.environ["TAVILY_API_KEY"] = "tavily_api_key"
-
-    llm = OpenAICompatibleClient(model=MODEL_ID, api_key=API_KEY, base_url=BASE_URL)
 
     user_prompt = input("请输入您的旅行需求：")
-    prompt_history = [f"用户请求：{user_prompt}"]
 
-    print("\n" + "="*50)
-    print(f"用户输入：{user_prompt}")
-    print("="*50)
-    for i in range(5):
-        print(f"\n>>> 正在进行第 {i + 1} 轮思考...")
+    # 初始状态
+    inputs = {"messages": [HumanMessage(content=user_prompt)]}
 
-        full_prompt = "\n".join(prompt_history)
-        llm_output = llm.generate(full_prompt, system_prompt=AGENT_SYSTEM_PROMPT)
+    # 流式观察 Agent 的思考过程
+    for chunk in app.stream(inputs, stream_mode="updates"):
+        for node_name, values in chunk.items():
+            print(f"\n[进入节点]: {node_name}")
+            last_msg = values["messages"][-1]
 
-        match = re.search(r'(Thought:.*?Action:.*?)(?=\n\s*(?:Thought:|Action:|Observation:)|\Z)', llm_output,
-                          re.DOTALL)
-        if match:
-            llm_output = match.group(1).strip()
+            if last_msg.content:
+                print(f"【AI 回复】: {last_msg.content}")
 
-        print(f"【AI 思考结果】:\n{llm_output}")
-        prompt_history.append(llm_output)
+            if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+                for t in last_msg.tool_calls:
+                    print(f"【准备调用】: {t['name']}({t['args']})")
 
-        action_match = re.search(r"Action: (.*)", llm_output)
-        if not action_match:
-            obs_str = "Observation: 错误：未检测到 Action 字段，请检查回复格式。"
-            print(obs_str)
-            prompt_history.append(obs_str)
-            continue
-
-        action_str = action_match.group(1).strip()
-
-        # 如果是任务结束信号
-        if action_str.startswith("Finish"):
-            # 提取 Finish[...] 括号里的最终答案
-            finish_match = re.match(r"Finish\[(.*)\]", action_str, re.DOTALL)
-            final_answer = finish_match.group(1) if finish_match else action_str
-            print("\n" + "★" * 20)
-            print(f"任务最终完成！\n结果: {final_answer}")
-            print("★" * 20)
-            break
-
-        try:
-            tool_name = re.search(r"(\w+)\(", action_str).group(1)
-            args_str = re.search(r"\((.*)\)", action_str).group(1)
-            kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
-
-            if tool_name in available_tools:
-                print(f"[执行] 正在调用工具 {tool_name}，参数为 {kwargs}...")
-                observation = available_tools[tool_name](**kwargs)
-            else:
-                observation = f"错误: 未找到名为 {tool_name} 的工具。"
-
-        except Exception as e:
-            observation = f"解析指令或执行工具时出错: {e}"
-
-        observation_str = f"Observation: {observation}"
-        print(f"【工具反馈结果】:\n{observation_str}")
-        prompt_history.append(observation_str)
-        print("-" * 50)
 
 if __name__ == "__main__":
     main()
